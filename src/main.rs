@@ -463,6 +463,43 @@ pub fn request_dhcp_info() -> Option<String> {
     None
 }
 
+/// Reads the BootOrder variable and returns the boot numbers it holds.
+///
+/// BootOrder grows with the number of boot entries, so it is read into an
+/// allocation of the size the firmware reports instead of a fixed buffer.
+fn read_boot_order() -> Vec<u16> {
+    let mut name_buf = [0u16; 12];
+    let name = CStr16::from_str_with_buf("BootOrder", &mut name_buf).unwrap();
+    match runtime::get_variable_boxed(name, &VariableVendor::GLOBAL_VARIABLE) {
+        Ok((data, _)) => data
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect(),
+        Err(e) => {
+            if e.status() != Status::NOT_FOUND {
+                info!("Failed to read BootOrder: {:?}", e.status());
+            }
+            Vec::new()
+        }
+    }
+}
+
+/// Reports whether the Boot#### variable for `boot_num` is present.
+///
+/// get_variable answers BUFFER_TOO_SMALL for a variable that exists but does
+/// not fit the buffer, so only NOT_FOUND means the slot is free. A load option
+/// never fits in a probe buffer, so testing the call with is_ok() would report
+/// every entry as absent.
+fn boot_option_exists(boot_num: u16) -> bool {
+    let boot_var = format!("Boot{:04X}", boot_num);
+    let mut name_buf = [0u16; 12];
+    let name = CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap();
+    match runtime::get_variable(name, &VariableVendor::GLOBAL_VARIABLE, &mut [0u8; 4]) {
+        Ok(_) => true,
+        Err(e) => e.status() != Status::NOT_FOUND,
+    }
+}
+
 /// Adds a UEFI boot entry for HTTP(S) boot to the given URL with the provided description.
 unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: &str) -> Result<(), Status> {
     use alloc::vec::Vec;
@@ -473,26 +510,11 @@ unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: 
     info!("Adding HTTP boot entry: {} -> {}", description, url);
 
     // 0. Check for existing entry with the same description
-    let mut bootorder = [0u16; 128];
-    let mut bootorder_bytes = unsafe {
-        core::slice::from_raw_parts_mut(bootorder.as_mut_ptr() as *mut u8, 128 * 2)
-    };
-    let mut binding = [0u16; 12];
-    let bootorder_name = CStr16::from_str_with_buf("BootOrder", &mut binding).unwrap();
-    let mut order_len = 0;
-    if let Ok((data, _)) = runtime::get_variable(bootorder_name, &VariableVendor::GLOBAL_VARIABLE, &mut bootorder_bytes) {
-        order_len = data.len() / 2;
-        for (i, chunk) in data.chunks_exact(2).enumerate() {
-            bootorder[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
-        }
-    }
-    for i in 0..order_len {
-        let boot_num = bootorder[i];
+    for boot_num in read_boot_order() {
         let boot_var = format!("Boot{:04X}", boot_num);
         let mut name_buf = [0u16; 12];
         let name = CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap();
-        let mut buf = [0u8; 1024];
-        if let Ok((data, _)) = runtime::get_variable(name, &VariableVendor::GLOBAL_VARIABLE, &mut buf) {
+        if let Ok((data, _)) = runtime::get_variable_boxed(name, &VariableVendor::GLOBAL_VARIABLE) {
             // EFI_LOAD_OPTION: attributes(4) + file_path_list_length(2) + description (utf16, null-terminated)
             if data.len() > 6 {
                 let desc_start = 6;
@@ -608,16 +630,14 @@ unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: 
 
     // 5. Find a free Boot#### variable
     let mut boot_num = 0x0001u16;
-    let mut boot_var = format!("Boot{:04X}", boot_num);
-    let mut name_buf = [0u16; 12];
-    while runtime::get_variable(
-        CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap(),
-        &VariableVendor::GLOBAL_VARIABLE,
-        &mut [0u8; 4],
-    ).is_ok() {
+    while boot_option_exists(boot_num) {
+        if boot_num == 0xFFFF {
+            info!("No free Boot#### variable is left");
+            return Err(Status::OUT_OF_RESOURCES);
+        }
         boot_num += 1;
-        boot_var = format!("Boot{:04X}", boot_num);
     }
+    let boot_var = format!("Boot{:04X}", boot_num);
     info!("Using boot variable: {}", boot_var);
 
     // 6. Set the Boot#### variable
@@ -635,34 +655,17 @@ unsafe fn add_http_boot_entry(nic_handle: uefi::Handle, url: &str, description: 
 
     // 7. Add to BootOrder
     // Clean up BootOrder: remove any entries that were deleted above (i.e., with the same description)
-    let mut bootorder = [0u16; 128];
-    let mut bootorder_bytes = unsafe {
-        core::slice::from_raw_parts_mut(bootorder.as_mut_ptr() as *mut u8, 128 * 2)
-    };
     let mut binding = [0u16; 12];
     let bootorder_name = CStr16::from_str_with_buf("BootOrder", &mut binding).unwrap();
-    let mut order_len = 0;
-    if let Ok((data, _)) = runtime::get_variable(bootorder_name, &VariableVendor::GLOBAL_VARIABLE, &mut bootorder_bytes) {
-        order_len = data.len() / 2;
-        for (i, chunk) in data.chunks_exact(2).enumerate() {
-            bootorder[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
-        }
-    }
-    // Remove deleted entries from BootOrder
     let mut new_order: Vec<u16> = Vec::new();
-    for i in 0..order_len {
-        let boot_num = bootorder[i];
-        let boot_var = format!("Boot{:04X}", boot_num);
-        let mut name_buf = [0u16; 12];
-        let name = CStr16::from_str_with_buf(&boot_var, &mut name_buf).unwrap();
-        let mut buf = [0u8; 4];
+    for existing in read_boot_order() {
         // Only keep if the variable still exists
-        if runtime::get_variable(name, &VariableVendor::GLOBAL_VARIABLE, &mut buf).is_ok() {
-            new_order.push(boot_num);
+        if existing != boot_num && boot_option_exists(existing) {
+            new_order.push(existing);
         }
     }
-    // Add the new entry
-    new_order.push(boot_num);
+    // Add the new entry first, so the firmware selects it on the next boot
+    new_order.insert(0, boot_num);
     let new_order_bytes = unsafe {
         core::slice::from_raw_parts(new_order.as_ptr() as *const u8, new_order.len() * 2)
     };
